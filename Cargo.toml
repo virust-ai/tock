@@ -90,6 +90,7 @@ members = [
     "chips/stm32f429zi",
     "chips/stm32f446re",
     "chips/stm32f412g",
+    "chips/stm32f412rg",
     "chips/stm32f4xx",
     "chips/veer_el2",
     "chips/virtio",

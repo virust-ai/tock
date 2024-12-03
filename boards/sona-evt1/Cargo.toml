@@ -13,7 +13,7 @@ edition.workspace = true
 components = { path = "../components" }
 cortexm4 = { path = "../../arch/cortex-m4" }
 kernel = { path = "../../kernel" }
-stm32f412g = { path = "../../chips/stm32f412g" }
+stm32f412rg = { path = "../../chips/stm32f412rg" }
 
 capsules-core = { path = "../../capsules/core" }
 capsules-extra = { path = "../../capsules/extra" }

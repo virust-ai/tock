@@ -64,7 +64,9 @@ impl<A: 'static + can::Can> CanComponent<A> {
     }
 }
 
-impl<A: 'static + can::Can> Component for CanComponent<A> {
+impl<A: 'static + can::Can + kernel::deferred_call::DeferredCallClient> Component
+    for CanComponent<A>
+{
     type StaticInput = (
         &'static mut MaybeUninit<CanCapsule<'static, A>>,
         &'static mut MaybeUninit<[u8; can::STANDARD_CAN_PACKET_SIZE]>,
@@ -85,6 +87,7 @@ impl<A: 'static + can::Can> Component for CanComponent<A> {
         can::Controller::set_client(self.can, Some(can));
         can::Transmit::set_client(self.can, Some(can));
         can::Receive::set_client(self.can, Some(can));
+        kernel::deferred_call::DeferredCallClient::register(self.can);
 
         can
     }

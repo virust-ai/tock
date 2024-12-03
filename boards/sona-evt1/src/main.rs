@@ -14,22 +14,18 @@
 use core::ptr::{addr_of, addr_of_mut};
 
 use capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm;
-use components::gpio::GpioComponent;
 use components::rng::RngComponent;
 use kernel::capabilities;
 use kernel::component::Component;
-use kernel::hil::gpio;
+use kernel::hil::i2c::I2CMaster;
 use kernel::hil::led::LedLow;
-use kernel::hil::screen::ScreenRotation;
 use kernel::platform::{KernelResources, SyscallDriverLookup};
 use kernel::scheduler::round_robin::RoundRobinSched;
 use kernel::{create_capability, debug, static_init};
-use stm32f412g::chip::Stm32f4xx;
-use stm32f412g::chip_specs::Stm32f412Specs;
-use stm32f412g::clocks::hsi::HSI_FREQUENCY_MHZ;
-use stm32f412g::interrupt_service::Stm32f412gDefaultPeripherals;
-use stm32f412g::rcc::PllSource;
-
+use stm32f412rg::chip_specs::Stm32f412Specs;
+use stm32f412rg::clocks::hsi::HSI_FREQUENCY_MHZ;
+use stm32f412rg::interrupt_service::Stm32f412rgDefaultPeripherals;
+use stm32f412rg::rcc::PllSource;
 /// Support routines for debugging I/O.
 pub mod io;
 
@@ -40,7 +36,8 @@ const NUM_PROCS: usize = 4;
 static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS] =
     [None, None, None, None];
 
-static mut CHIP: Option<&'static stm32f412g::chip::Stm32f4xx<Stm32f412gDefaultPeripherals>> = None;
+static mut CHIP: Option<&'static stm32f412rg::chip::Stm32f4xx<Stm32f412rgDefaultPeripherals>> =
+    None;
 static mut PROCESS_PRINTER: Option<&'static capsules_system::process_printer::ProcessPrinterText> =
     None;
 
@@ -54,33 +51,33 @@ const FAULT_RESPONSE: capsules_system::process_policies::PanicFaultPolicy =
 pub static mut STACK_MEMORY: [u8; 0x2000] = [0; 0x2000];
 
 type TemperatureSTMSensor = components::temperature_stm::TemperatureSTMComponentType<
-    capsules_core::virtualizers::virtual_adc::AdcDevice<'static, stm32f412g::adc::Adc<'static>>,
+    capsules_core::virtualizers::virtual_adc::AdcDevice<'static, stm32f412rg::adc::Adc<'static>>,
 >;
 type TemperatureDriver = components::temperature::TemperatureComponentType<TemperatureSTMSensor>;
-type RngDriver = components::rng::RngComponentType<stm32f412g::trng::Trng<'static>>;
+type RngDriver = components::rng::RngComponentType<stm32f412rg::trng::Trng<'static>>;
 
 /// A structure representing this platform that holds references to all
 /// capsules for this platform.
 struct STM32F412GDiscovery {
     console: &'static capsules_core::console::Console<'static>,
     ipc: kernel::ipc::IPC<{ NUM_PROCS as u8 }>,
-    led: &'static capsules_core::led::LedDriver<
-        'static,
-        LedLow<'static, stm32f412g::gpio::Pin<'static>>,
-        7,
-    >,
-    button: &'static capsules_core::button::Button<'static, stm32f412g::gpio::Pin<'static>>,
     alarm: &'static capsules_core::alarm::AlarmDriver<
         'static,
-        VirtualMuxAlarm<'static, stm32f412g::tim2::Tim2<'static>>,
+        VirtualMuxAlarm<'static, stm32f412rg::tim2::Tim2<'static>>,
     >,
-    gpio: &'static capsules_core::gpio::GPIO<'static, stm32f412g::gpio::Pin<'static>>,
-    // adc: &'static capsules_core::adc::AdcVirtualized<'static>,
-    // touch: &'static capsules_extra::touch::Touch<'static>,
-    // screen: &'static capsules_extra::screen::Screen<'static>,
+    leds: &'static capsules_core::led::LedDriver<
+        'static,
+        LedLow<'static, stm32f412rg::gpio::Pin<'static>>,
+        2,
+    >,
+
     temperature: &'static TemperatureDriver,
     rng: &'static RngDriver,
-
+    i2c: &'static capsules_core::i2c_master::I2CMasterDriver<
+        'static,
+        stm32f412rg::i2c::I2C<'static>,
+    >,
+    can: &'static capsules_extra::can::CanCapsule<'static, stm32f412rg::can::Can<'static>>,
     scheduler: &'static RoundRobinSched<'static>,
     systick: cortexm4::systick::SysTick,
 }
@@ -93,14 +90,11 @@ impl SyscallDriverLookup for STM32F412GDiscovery {
     {
         match driver_num {
             capsules_core::console::DRIVER_NUM => f(Some(self.console)),
-            capsules_core::led::DRIVER_NUM => f(Some(self.led)),
-            capsules_core::button::DRIVER_NUM => f(Some(self.button)),
             capsules_core::alarm::DRIVER_NUM => f(Some(self.alarm)),
             kernel::ipc::DRIVER_NUM => f(Some(&self.ipc)),
-            capsules_core::gpio::DRIVER_NUM => f(Some(self.gpio)),
-            // capsules_core::adc::DRIVER_NUM => f(Some(self.adc)),
-            // capsules_extra::touch::DRIVER_NUM => f(Some(self.touch)),
-            // capsules_extra::screen::DRIVER_NUM => f(Some(self.screen)),
+            capsules_extra::can::DRIVER_NUM => f(Some(self.can)),
+            capsules_core::i2c_master::DRIVER_NUM => f(Some(self.i2c)),
+            capsules_core::led::DRIVER_NUM => f(Some(self.leds)),
             capsules_extra::temperature::DRIVER_NUM => f(Some(self.temperature)),
             capsules_core::rng::DRIVER_NUM => f(Some(self.rng)),
             _ => f(None),
@@ -110,9 +104,9 @@ impl SyscallDriverLookup for STM32F412GDiscovery {
 
 impl
     KernelResources<
-        stm32f412g::chip::Stm32f4xx<
+        stm32f412rg::chip::Stm32f4xx<
             'static,
-            stm32f412g::interrupt_service::Stm32f412gDefaultPeripherals<'static>,
+            stm32f412rg::interrupt_service::Stm32f412rgDefaultPeripherals<'static>,
         >,
     > for STM32F412GDiscovery
 {
@@ -149,12 +143,12 @@ impl
 
 /// Helper function called during bring-up that configures DMA.
 unsafe fn setup_dma(
-    dma: &stm32f412g::dma::Dma2,
-    dma_streams: &'static [stm32f412g::dma::Stream<stm32f412g::dma::Dma2>; 8],
-    usart1: &'static stm32f412g::usart::Usart<stm32f412g::dma::Dma2>,
+    dma: &stm32f412rg::dma::Dma2,
+    dma_streams: &'static [stm32f412rg::dma::Stream<stm32f412rg::dma::Dma2>; 8],
+    usart1: &'static stm32f412rg::usart::Usart<stm32f412rg::dma::Dma2>,
 ) {
-    use stm32f412g::dma::Dma2Peripheral;
-    use stm32f412g::usart;
+    use stm32f412rg::dma::Dma2Peripheral;
+    use stm32f412rg::usart;
 
     dma.enable_clock();
 
@@ -178,13 +172,13 @@ unsafe fn setup_dma(
 
 /// Helper function called during bring-up that configures multiplexed I/O.
 unsafe fn set_pin_primary_functions(
-    syscfg: &stm32f412g::syscfg::Syscfg,
-    i2c1: &stm32f412g::i2c::I2C,
-    gpio_ports: &'static stm32f412g::gpio::GpioPorts<'static>,
+    syscfg: &stm32f412rg::syscfg::Syscfg,
+    i2c1: &stm32f412rg::i2c::I2C,
+    gpio_ports: &'static stm32f412rg::gpio::GpioPorts<'static>,
     peripheral_clock_frequency: usize,
 ) {
     use kernel::hil::gpio::Configure;
-    use stm32f412g::gpio::{AlternateFunction, Mode, PinId, PortId};
+    use stm32f412rg::gpio::{AlternateFunction, Mode, PinId, PortId};
 
     syscfg.enable_clock();
 
@@ -199,21 +193,21 @@ unsafe fn set_pin_primary_functions(
     gpio_ports.get_port_from_port_id(PortId::G).enable_clock();
     gpio_ports.get_port_from_port_id(PortId::H).enable_clock();
 
-    // // User LED1 is connected to PC10. Configure PC10 as `debug_gpio!(0, ...)`
-    // gpio_ports.get_pin(PinId::PC10).map(|pin| {
-    //     pin.make_output();
-
-    //     // Configure kernel debug gpios as early as possible
-    //     kernel::debug::assign_gpios(Some(pin), None, None);
-    // });
-
-    // // User LED2 is connected to PB05. Configure PB05 as `debug_gpio!(1, ...)`
-    // gpio_ports.get_pin(PinId::PB05).map(|pin| {
-    //     pin.make_output();
-
-    //     // Configure kernel debug gpios as early as possible
-    //     kernel::debug::assign_gpios(None, Some(pin), None);
-    // });
+    // User LED1 is connected to PC10. Configure PC10 as `debug_gpio!(0, ...)`
+    // Configure kernel debug gpios as early as possible
+    kernel::debug::assign_gpios(
+        Some(
+            gpio_ports
+                .get_pin(PinId::PC10)
+                .expect("Can't request user led1"),
+        ),
+        Some(
+            gpio_ports
+                .get_pin(PinId::PB05)
+                .expect("Can't request user led2"),
+        ),
+        None,
+    );
 
     //pa2 and pa3 (USART2) is connected to ST-LINK virtual COM port
     gpio_ports.get_pin(PinId::PA09).map(|pin| {
@@ -247,24 +241,29 @@ unsafe fn set_pin_primary_functions(
 
     i2c1.enable_clock();
     i2c1.set_speed(
-        stm32f412g::i2c::I2CSpeed::Speed400k,
+        stm32f412rg::i2c::I2CSpeed::Speed100k,
         peripheral_clock_frequency,
     );
 }
 
 /// Helper function for miscellaneous peripheral functions
 unsafe fn setup_peripherals(
-    tim2: &stm32f412g::tim2::Tim2,
-    fsmc: &stm32f412g::fsmc::Fsmc,
-    trng: &stm32f412g::trng::Trng,
+    tim2: &stm32f412rg::tim2::Tim2,
+    fsmc: &stm32f412rg::fsmc::Fsmc,
+    trng: &stm32f412rg::trng::Trng,
+    i2c: &stm32f412rg::i2c::I2C,
 ) {
     // USART2 IRQn is 38
-    cortexm4::nvic::Nvic::new(stm32f412g::nvic::USART1).enable();
+    cortexm4::nvic::Nvic::new(stm32f412rg::nvic::USART1).enable();
 
     // TIM2 IRQn is 28
     tim2.enable_clock();
     tim2.start();
-    cortexm4::nvic::Nvic::new(stm32f412g::nvic::TIM2).enable();
+    cortexm4::nvic::Nvic::new(stm32f412rg::nvic::TIM2).enable();
+
+    i2c.enable_clock();
+    cortexm4::nvic::Nvic::new(stm32f412rg::nvic::I2C1_EV).enable();
+    cortexm4::nvic::Nvic::new(stm32f412rg::nvic::I2C1_ER).enable();
 
     // FSMC
     fsmc.enable();
@@ -282,52 +281,56 @@ unsafe fn setup_peripherals(
 unsafe fn start() -> (
     &'static kernel::Kernel,
     STM32F412GDiscovery,
-    &'static stm32f412g::chip::Stm32f4xx<'static, Stm32f412gDefaultPeripherals<'static>>,
+    &'static stm32f412rg::chip::Stm32f4xx<'static, Stm32f412rgDefaultPeripherals<'static>>,
 ) {
-    stm32f412g::init();
+    stm32f412rg::init();
 
-    let rcc = static_init!(stm32f412g::rcc::Rcc, stm32f412g::rcc::Rcc::new());
+    let rcc = static_init!(stm32f412rg::rcc::Rcc, stm32f412rg::rcc::Rcc::new());
     let clocks = static_init!(
-        stm32f412g::clocks::Clocks<Stm32f412Specs>,
-        stm32f412g::clocks::Clocks::new(rcc)
+        stm32f412rg::clocks::Clocks<Stm32f412Specs>,
+        stm32f412rg::clocks::Clocks::new(rcc)
     );
 
     let syscfg = static_init!(
-        stm32f412g::syscfg::Syscfg,
-        stm32f412g::syscfg::Syscfg::new(clocks)
+        stm32f412rg::syscfg::Syscfg,
+        stm32f412rg::syscfg::Syscfg::new(clocks)
     );
 
-    let exti = static_init!(stm32f412g::exti::Exti, stm32f412g::exti::Exti::new(syscfg));
+    let exti = static_init!(
+        stm32f412rg::exti::Exti,
+        stm32f412rg::exti::Exti::new(syscfg)
+    );
 
-    let dma1 = static_init!(stm32f412g::dma::Dma1, stm32f412g::dma::Dma1::new(clocks));
-    let dma2 = static_init!(stm32f412g::dma::Dma2, stm32f412g::dma::Dma2::new(clocks));
+    let dma1 = static_init!(stm32f412rg::dma::Dma1, stm32f412rg::dma::Dma1::new(clocks));
+    let dma2 = static_init!(stm32f412rg::dma::Dma2, stm32f412rg::dma::Dma2::new(clocks));
 
     let peripherals = static_init!(
-        Stm32f412gDefaultPeripherals,
-        Stm32f412gDefaultPeripherals::new(clocks, exti, dma1, dma2)
+        Stm32f412rgDefaultPeripherals,
+        Stm32f412rgDefaultPeripherals::new(clocks, exti, dma1, dma2)
     );
-
     peripherals.init();
 
-    let _ = clocks.set_ahb_prescaler(stm32f412g::rcc::AHBPrescaler::DivideBy1);
-    let _ = clocks.set_apb1_prescaler(stm32f412g::rcc::APBPrescaler::DivideBy4);
-    let _ = clocks.set_apb2_prescaler(stm32f412g::rcc::APBPrescaler::DivideBy2);
+    let _ = clocks.set_ahb_prescaler(stm32f412rg::rcc::AHBPrescaler::DivideBy1);
+    let _ = clocks.set_apb1_prescaler(stm32f412rg::rcc::APBPrescaler::DivideBy4);
+    let _ = clocks.set_apb2_prescaler(stm32f412rg::rcc::APBPrescaler::DivideBy2);
     let _ = clocks.set_pll_frequency_mhz(PllSource::HSI, 100);
     let _ = clocks.pll.enable();
-    let _ = clocks.set_sys_clock_source(stm32f412g::rcc::SysClockSource::PLL);
+    let _ = clocks.set_sys_clock_source(stm32f412rg::rcc::SysClockSource::PLL);
+    let apb1_frequence_mhz = clocks.get_apb1_frequency_mhz();
 
     let base_peripherals = &peripherals.stm32f4;
     setup_peripherals(
         &base_peripherals.tim2,
         &base_peripherals.fsmc,
         &peripherals.trng,
+        &base_peripherals.i2c1,
     );
 
     set_pin_primary_functions(
         syscfg,
         &base_peripherals.i2c1,
         &base_peripherals.gpio_ports,
-        clocks.get_apb1_frequency_mhz(),
+        apb1_frequence_mhz,
     );
 
     setup_dma(
@@ -339,13 +342,31 @@ unsafe fn start() -> (
     let board_kernel = static_init!(kernel::Kernel, kernel::Kernel::new(&*addr_of!(PROCESSES)));
 
     let chip = static_init!(
-        stm32f412g::chip::Stm32f4xx<Stm32f412gDefaultPeripherals>,
-        stm32f412g::chip::Stm32f4xx::new(peripherals)
+        stm32f412rg::chip::Stm32f4xx<Stm32f412rgDefaultPeripherals>,
+        stm32f412rg::chip::Stm32f4xx::new(peripherals)
     );
     CHIP = Some(chip);
 
-    // UART
+    // USER LEDs
+    let leds = components::led::LedsComponent::new().finalize(components::led_component_static!(
+        LedLow<'static, stm32f412rg::gpio::Pin>,
+        // User Led1
+        LedLow::new(
+            base_peripherals
+                .gpio_ports
+                .get_pin(stm32f412rg::gpio::PinId::PC10)
+                .unwrap()
+        ),
+        // User Led2
+        LedLow::new(
+            base_peripherals
+                .gpio_ports
+                .get_pin(stm32f412rg::gpio::PinId::PB05)
+                .unwrap()
+        ),
+    ));
 
+    // UART
     // Create a shared UART channel for kernel debug.
     base_peripherals.usart1.enable_clock();
     let uart_mux = components::console::UartMuxComponent::new(&base_peripherals.usart1, 115200)
@@ -372,176 +393,11 @@ unsafe fn start() -> (
 
     // LEDs
 
-    // Clock to Port A is enabled in `set_pin_primary_functions()`
-
-    let led = components::led::LedsComponent::new().finalize(components::led_component_static!(
-        LedLow<'static, stm32f412g::gpio::Pin>,
-        // Turn Left
-        LedLow::new(
-            base_peripherals
-                .gpio_ports
-                .get_pin(stm32f412g::gpio::PinId::PB15)
-                .unwrap()
-        ),
-        // Turn Right
-        LedLow::new(
-            base_peripherals
-                .gpio_ports
-                .get_pin(stm32f412g::gpio::PinId::PC08)
-                .unwrap()
-        ),
-        // Cos Lamp
-        LedLow::new(
-            base_peripherals
-                .gpio_ports
-                .get_pin(stm32f412g::gpio::PinId::PC06)
-                .unwrap()
-        ),
-        // Pha Lamp
-        LedLow::new(
-            base_peripherals
-                .gpio_ports
-                .get_pin(stm32f412g::gpio::PinId::PB13)
-                .unwrap()
-        ),
-        // Sound Engine
-        // License Lamp
-        LedLow::new(
-            base_peripherals
-                .gpio_ports
-                .get_pin(stm32f412g::gpio::PinId::PC12)
-                .unwrap()
-        ),
-        // Horn
-        LedLow::new(
-            base_peripherals
-                .gpio_ports
-                .get_pin(stm32f412g::gpio::PinId::PA08)
-                .unwrap()
-        ),
-        // Seat
-        LedLow::new(
-            base_peripherals
-                .gpio_ports
-                .get_pin(stm32f412g::gpio::PinId::PD02)
-                .unwrap()
-        )
-    ));
-
-    // BUTTONs
-    let button = components::button::ButtonComponent::new(
-        board_kernel,
-        capsules_core::button::DRIVER_NUM,
-        components::button_component_helper!(
-            stm32f412g::gpio::Pin,
-            // Mode SW
-            (
-                base_peripherals
-                    .gpio_ports
-                    .get_pin(stm32f412g::gpio::PinId::PA06)
-                    .unwrap(),
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullNone
-            ),
-            // Sidestand
-            (
-                base_peripherals
-                    .gpio_ports
-                    .get_pin(stm32f412g::gpio::PinId::PA01)
-                    .unwrap(),
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullNone
-            ),
-            // Reverse SW
-            (
-                base_peripherals
-                    .gpio_ports
-                    .get_pin(stm32f412g::gpio::PinId::PA07)
-                    .unwrap(),
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullNone
-            ),
-            // Horn SW
-            (
-                base_peripherals
-                    .gpio_ports
-                    .get_pin(stm32f412g::gpio::PinId::PB00)
-                    .unwrap(),
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullNone
-            ),
-            // PhaCos Power SW
-            (
-                base_peripherals
-                    .gpio_ports
-                    .get_pin(stm32f412g::gpio::PinId::PC04)
-                    .unwrap(),
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullNone
-            ),
-            // Pha/Passing SW
-            (
-                base_peripherals
-                    .gpio_ports
-                    .get_pin(stm32f412g::gpio::PinId::PC05)
-                    .unwrap(),
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullNone
-            ),
-            // Braker SW
-            (
-                base_peripherals
-                    .gpio_ports
-                    .get_pin(stm32f412g::gpio::PinId::PA04)
-                    .unwrap(),
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullNone
-            ),
-            // TurnL SW
-            (
-                base_peripherals
-                    .gpio_ports
-                    .get_pin(stm32f412g::gpio::PinId::PB01)
-                    .unwrap(),
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullNone
-            ),
-            // TurnR SW
-            (
-                base_peripherals
-                    .gpio_ports
-                    .get_pin(stm32f412g::gpio::PinId::PA00)
-                    .unwrap(),
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullNone
-            ),
-            // Keyfob A
-            (
-                base_peripherals
-                    .gpio_ports
-                    .get_pin(stm32f412g::gpio::PinId::PC01)
-                    .unwrap(),
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullNone
-            ),
-            // Keyfob B
-            (
-                base_peripherals
-                    .gpio_ports
-                    .get_pin(stm32f412g::gpio::PinId::PC00)
-                    .unwrap(),
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullNone
-            )
-        ),
-    )
-    .finalize(components::button_component_static!(stm32f412g::gpio::Pin));
-
     // ALARM
 
     let tim2 = &base_peripherals.tim2;
     let mux_alarm = components::alarm::AlarmMuxComponent::new(tim2).finalize(
-        components::alarm_mux_component_static!(stm32f412g::tim2::Tim2),
+        components::alarm_mux_component_static!(stm32f412rg::tim2::Tim2),
     );
 
     let alarm = components::alarm::AlarmDriverComponent::new(
@@ -549,42 +405,7 @@ unsafe fn start() -> (
         capsules_core::alarm::DRIVER_NUM,
         mux_alarm,
     )
-    .finalize(components::alarm_component_static!(stm32f412g::tim2::Tim2));
-
-    // GPIO
-    let gpio = GpioComponent::new(
-        board_kernel,
-        capsules_core::gpio::DRIVER_NUM,
-        components::gpio_component_helper!(
-            stm32f412g::gpio::Pin,
-            // Arduino like RX/TX
-            0 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PG09).unwrap(), //D0
-            1 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PG14).unwrap(), //D1
-            2 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PG13).unwrap(), //D2
-            3 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PF04).unwrap(), //D3
-            4 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PG12).unwrap(), //D4
-            5 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PF10).unwrap(), //D5
-            6 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PF03).unwrap(), //D6
-            7 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PG11).unwrap(), //D7
-            8 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PG10).unwrap(), //D8
-            9 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PB08).unwrap(), //D9
-            // SPI Pins
-            10 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PA15).unwrap(), //D10
-            11 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PA07).unwrap(),  //D11
-            12 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PA06).unwrap(),  //D12
-            13 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PA15).unwrap()  //D13
-
-            // ADC Pins
-            // Enable the to use the ADC pins as GPIO
-            // 14 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PA01).unwrap(), //A0
-            // 15 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PC01).unwrap(), //A1
-            // 16 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PC03).unwrap(), //A2
-            // 17 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PC04).unwrap(), //A3
-            // 19 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PC05).unwrap(), //A4
-            // 20 => base_peripherals.gpio_ports.get_pin(stm32f412g::gpio::PinId::PB00).unwrap() //A5
-        ),
-    )
-    .finalize(components::gpio_component_static!(stm32f412g::gpio::Pin));
+    .finalize(components::alarm_component_static!(stm32f412rg::tim2::Tim2));
 
     // RNG
     let rng = RngComponent::new(
@@ -592,87 +413,53 @@ unsafe fn start() -> (
         capsules_core::rng::DRIVER_NUM,
         &peripherals.trng,
     )
-    .finalize(components::rng_component_static!(stm32f412g::trng::Trng));
+    .finalize(components::rng_component_static!(stm32f412rg::trng::Trng));
 
     // I2C Master
-    let mux_i2c = components::i2c::I2CMuxComponent::new(&base_peripherals.i2c1, None)
-        .finalize(components::i2c_mux_component_static!(stm32f412g::i2c::I2C));
+    // initialize capabilities
+    let memory_allocation_cap = create_capability!(capabilities::MemoryAllocationCapability);
+    // Init the I2C device attached via Qwiic
+    let i2c_master_buffer: &mut [u8; 64] = static_init!(
+        [u8; capsules_core::i2c_master::BUFFER_LENGTH],
+        [0; capsules_core::i2c_master::BUFFER_LENGTH]
+    );
+    let i2c = static_init!(
+        capsules_core::i2c_master::I2CMasterDriver<'static, stm32f412rg::i2c::I2C<'static>>,
+        capsules_core::i2c_master::I2CMasterDriver::new(
+            &base_peripherals.i2c1,
+            i2c_master_buffer,
+            board_kernel.create_grant(
+                capsules_core::i2c_master::DRIVER_NUM,
+                &memory_allocation_cap
+            )
+        )
+    );
 
-    // FT6206
+    base_peripherals.i2c1.set_master_client(i2c);
+    base_peripherals.i2c1.enable();
 
-    // let mux_i2c = components::i2c::I2CMuxComponent::new(&base_peripherals.i2c1, None)
-    //     .finalize(components::i2c_mux_component_static!(stm32f412g::i2c::I2C));
-
-    // let ft6x06 = components::ft6x06::Ft6x06Component::new(
-    //     mux_i2c,
-    //     0x38,
-    //     base_peripherals
-    //         .gpio_ports
-    //         .get_pin(stm32f412g::gpio::PinId::PG05)
-    //         .unwrap(),
-    // )
-    // .finalize(components::ft6x06_component_static!(stm32f412g::i2c::I2C));
-
-    // let bus = components::bus::Bus8080BusComponent::new(&base_peripherals.fsmc).finalize(
-    //     components::bus8080_bus_component_static!(stm32f412g::fsmc::Fsmc,),
-    // );
-
-    // let tft = components::st77xx::ST77XXComponent::new(
-    //     mux_alarm,
-    //     bus,
-    //     None,
-    //     base_peripherals
-    //         .gpio_ports
-    //         .get_pin(stm32f412g::gpio::PinId::PD11),
-    //     &capsules_extra::st77xx::ST7789H2,
-    // )
-    // .finalize(components::st77xx_component_static!(
-    //     // bus type
-    //     capsules_extra::bus::Bus8080Bus<'static, stm32f412g::fsmc::Fsmc>,
-    //     // timer type
-    //     stm32f412g::tim2::Tim2,
-    //     // pin type
-    //     stm32f412g::gpio::Pin,
-    // ));
-
-    // let _ = tft.init();
-
-    // let screen = components::screen::ScreenComponent::new(
-    //     board_kernel,
-    //     capsules_extra::screen::DRIVER_NUM,
-    //     tft,
-    //     Some(tft),
-    // )
-    // .finalize(components::screen_component_static!(1024));
-
-    // let touch = components::touch::MultiTouchComponent::new(
-    //     board_kernel,
-    //     capsules_extra::touch::DRIVER_NUM,
-    //     ft6x06,
-    //     Some(ft6x06),
-    //     Some(tft),
-    // )
-    // .finalize(components::touch_component_static!());
-
-    // touch.set_screen_rotation_offset(ScreenRotation::Rotated90);
-
-    // Uncomment this for multi touch support
-    // let touch =
-    //     components::touch::MultiTouchComponent::new(board_kernel, ft6x06, Some(ft6x06), None)
-    //         .finalize(());
+    // CAN
+    let can = components::can::CanComponent::new(
+        board_kernel,
+        capsules_extra::can::DRIVER_NUM,
+        &peripherals.can1,
+    )
+    .finalize(components::can_component_static!(
+        stm32f412rg::can::Can<'static>
+    ));
 
     // ADC
     let adc_mux = components::adc::AdcMuxComponent::new(&base_peripherals.adc1)
-        .finalize(components::adc_mux_component_static!(stm32f412g::adc::Adc));
+        .finalize(components::adc_mux_component_static!(stm32f412rg::adc::Adc));
 
     let temp_sensor = components::temperature_stm::TemperatureSTMComponent::new(
         adc_mux,
-        stm32f412g::adc::Channel::Channel18,
+        stm32f412rg::adc::Channel::Channel18,
         2.5,
         0.76,
     )
     .finalize(components::temperature_stm_adc_component_static!(
-        stm32f412g::adc::Adc
+        stm32f412rg::adc::Adc
     ));
 
     let temp = components::temperature::TemperatureComponent::new(
@@ -683,41 +470,6 @@ unsafe fn start() -> (
     .finalize(components::temperature_component_static!(
         TemperatureSTMSensor
     ));
-
-    // let adc_channel_0 =
-    //     components::adc::AdcComponent::new(adc_mux, stm32f412g::adc::Channel::Channel1)
-    //         .finalize(components::adc_component_static!(stm32f412g::adc::Adc));
-
-    // let adc_channel_1 =
-    //     components::adc::AdcComponent::new(adc_mux, stm32f412g::adc::Channel::Channel11)
-    //         .finalize(components::adc_component_static!(stm32f412g::adc::Adc));
-
-    // let adc_channel_2 =
-    //     components::adc::AdcComponent::new(adc_mux, stm32f412g::adc::Channel::Channel13)
-    //         .finalize(components::adc_component_static!(stm32f412g::adc::Adc));
-
-    // let adc_channel_3 =
-    //     components::adc::AdcComponent::new(adc_mux, stm32f412g::adc::Channel::Channel14)
-    //         .finalize(components::adc_component_static!(stm32f412g::adc::Adc));
-
-    // let adc_channel_4 =
-    //     components::adc::AdcComponent::new(adc_mux, stm32f412g::adc::Channel::Channel15)
-    //         .finalize(components::adc_component_static!(stm32f412g::adc::Adc));
-
-    // let adc_channel_5 =
-    //     components::adc::AdcComponent::new(adc_mux, stm32f412g::adc::Channel::Channel8)
-    //         .finalize(components::adc_component_static!(stm32f412g::adc::Adc));
-
-    // let adc_syscall =
-    //     components::adc::AdcVirtualComponent::new(board_kernel, capsules_core::adc::DRIVER_NUM)
-    //         .finalize(components::adc_syscall_component_helper!(
-    //             adc_channel_0,
-    //             adc_channel_1,
-    //             adc_channel_2,
-    //             adc_channel_3,
-    //             adc_channel_4,
-    //             adc_channel_5
-    //         ));
 
     let process_printer = components::process_printer::ProcessPrinterTextComponent::new()
         .finalize(components::process_printer_text_component_static!());
@@ -732,7 +484,7 @@ unsafe fn start() -> (
         Some(cortexm4::support::reset),
     )
     .finalize(components::process_console_component_static!(
-        stm32f412g::tim2::Tim2
+        stm32f412rg::tim2::Tim2
     ));
     let _ = process_console.start();
 
@@ -746,28 +498,22 @@ unsafe fn start() -> (
             kernel::ipc::DRIVER_NUM,
             &memory_allocation_capability,
         ),
-        led,
-        button,
         alarm,
-        gpio,
-        // adc: adc_syscall,
-        // touch,
-        // screen,
+        leds,
         temperature: temp,
         rng,
-
+        can,
+        i2c,
         scheduler,
         systick: cortexm4::systick::SysTick::new_with_calibration(
             (HSI_FREQUENCY_MHZ * 1_000_000) as u32,
         ),
     };
-
-    // // Optional kernel tests
-    // //
-    // // See comment in `boards/imix/src/main.rs`
-    // virtual_uart_rx_test::run_virtual_uart_receive(mux_uart);
-    // base_peripherals.fsmc.write(0x04, 120);
-    // debug!("id {}", base_peripherals.fsmc.read(0x05));
+    debug!("\n\rSystem Clock Infor: ");
+    debug!(" => APB  : {}Mhz", clocks.get_ahb_frequency_mhz());
+    debug!(" => APB1 : {}Mhz", clocks.get_apb1_frequency_mhz());
+    debug!(" => APB2 : {}Mhz", clocks.get_apb2_frequency_mhz());
+    debug!(" => SYS  : {}Mhz", clocks.get_sys_clock_frequency_mhz());
 
     debug!("Initialization complete. Entering main loop");
 
@@ -815,7 +561,7 @@ unsafe fn start() -> (
 
     //Uncomment to run multi alarm test
     /*components::test::multi_alarm_test::MultiAlarmTestComponent::new(mux_alarm)
-    .finalize(components::multi_alarm_test_component_buf!(stm32f412g::tim2::Tim2))
+    .finalize(components::multi_alarm_test_component_buf!(stm32f412rg::tim2::Tim2))
     .run();*/
 
     (board_kernel, stm32f412g, chip)
